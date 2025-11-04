@@ -401,66 +401,70 @@ def descargar_factura() -> Dict[str, str]:
         ruta_archivo = directorio_destino / "invoice.pdf"
         print(f"📁 Directorio de factura: {directorio_destino}")
 
-        # ---- Click en “Descargar factura”
-        print("⬇️ Pulsando 'Descargar factura'…")
+        # ---- Click en “Descargar factura” (ACELERADO)
+        print("⬇️ Pulsando 'Descargar factura' (rápido)…")
+        DOWNLOAD_WAIT_VISIBLE = 1500   # 1.5s para que aparezca
+        DOWNLOAD_EXPECT_MS   = 8000    # 8s para que arranque la descarga
+
         download = None
+
+        def _try_click_fast(loc):
+            """Click inmediato/forzado y esperar descarga con timeout corto."""
+            nonlocal download
+            try:
+                loc.wait_for(state="visible", timeout=DOWNLOAD_WAIT_VISIBLE)
+            except:
+                pass
+            try:
+                with invoice_page.expect_download(timeout=DOWNLOAD_EXPECT_MS) as dlinfo:
+                    loc.click(timeout=DOWNLOAD_WAIT_VISIBLE, force=True)
+                download = dlinfo.value
+                return True
+            except Exception:
+                return False
 
         # 1) data-testid oficial de Stripe
         try:
             btn = invoice_page.locator("[data-testid='download-invoice-pdf-button']").first
-            btn.wait_for(state="visible", timeout=12000)
-            btn.scroll_into_view_if_needed()
-            with invoice_page.expect_download(timeout=40000) as dlinfo:
-                btn.click()
-            download = dlinfo.value
-        except PWTimeout:
-            pass
-        except:
+            if not _try_click_fast(btn):
+                pass
+        except Exception:
             pass
 
-        # 2) Texto visible
+        # 2) Texto visible (fallback rápido)
         if not download:
-            for txt in ["Descargar factura", "Download invoice", "Descargar", "Download", "Descargar PDF"]:
+            for txt in ["Descargar factura", "Download invoice", "Download", "Descargar", "Descargar PDF"]:
                 try:
                     btn = invoice_page.get_by_text(txt, exact=False).first
-                    btn.wait_for(state="visible", timeout=6000)
-                    btn.scroll_into_view_if_needed()
-                    with invoice_page.expect_download(timeout=40000) as dlinfo:
-                        btn.click()
-                    download = dlinfo.value
-                    break
-                except:
+                    if _try_click_fast(btn):
+                        break
+                except Exception:
                     continue
 
-        # 3) Selectores genéricos
+        # 3) Selectores genéricos (último recurso)
         if not download:
             for sel in [
                 'button:has-text("Descargar factura")',
                 'a:has-text("Descargar factura")',
                 'button:has-text("Download")',
                 'a:has-text("Download")',
-                "[data-testid='download-invoice-receipt-pdf-button']"  # último recurso (recibo)
+                "[data-testid='download-invoice-receipt-pdf-button']"  # recibo si el otro falla
             ]:
                 try:
                     btn = invoice_page.locator(sel).first
-                    btn.wait_for(state="visible", timeout=6000)
-                    btn.scroll_into_view_if_needed()
-                    with invoice_page.expect_download(timeout=40000) as dlinfo:
-                        btn.click()
-                    download = dlinfo.value
-                    break
-                except:
+                    if _try_click_fast(btn):
+                        break
+                except Exception:
                     continue
 
         if not download:
-            raise Exception("No se pudo iniciar la descarga del PDF de la factura.")
+            raise Exception("No se pudo iniciar la descarga del PDF de la factura (timeout rápido).")
 
         # Guardar archivo
         print(f"💾 Guardando en: {ruta_archivo}")
         try:
             download.save_as(str(ruta_archivo))
         except Exception as e:
-            # fallback si Playwright ya lo movió temporalmente
             temp_path = None
             try:
                 temp_path = download.path()
