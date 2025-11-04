@@ -1,13 +1,12 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 import uvicorn
 import re
 import asyncio
-import os
 
 app = FastAPI(title="API de Facturas Cursor", description="API para descargar facturas de Cursor.com")
 
@@ -32,7 +31,6 @@ def _auto_scroll_until_bottom(page_or_frame, *, step_px: int = 1200, max_tries: 
             break
 
 def _quick_scroll(page_or_frame):
-    """Empujón de scroll muy rápido para forzar lazy-load sin bucles largos."""
     try:
         page_or_frame.evaluate("""
             () => {
@@ -93,55 +91,35 @@ def _wait_for_invoice_list(target, timeout_ms: int = 12000):
             continue
     return False
 
-def _find_first_invoice_href_fast(target):
-    """
-    Devuelve el primer href de factura (invoice.stripe.com/i/...) sin scrollear.
-    Si no aparece a la primera, pulsa “Ver más” y hace un mini scroll rápido.
-    """
-    def _grab():
+def _expand_all_invoices(target, max_clicks: int = 30):
+    """Pulsa 'Ver más' repetidamente hasta que ya no aparezca."""
+    clicks = 0
+    while clicks < max_clicks:
         try:
-            return target.evaluate("""
-                () => {
-                    const as = Array.from(document.querySelectorAll("a[href*='invoice.stripe.com/i/']"));
-                    return as.length ? as[0].href : null;
-                }
-            """)
+            btn = target.get_by_text("Ver más", exact=False).first
+            btn.wait_for(state="visible", timeout=500)
+            btn.scroll_into_view_if_needed()
+            btn.click(timeout=500)
+            target.wait_for_timeout(200)
+            clicks += 1
         except:
-            return None
-
-    href = _grab()
-    if href:
-        return href
-
-    # Intento 1: 'Ver más'
-    try:
-        btn = target.get_by_text("Ver más", exact=False).first
-        btn.click(timeout=800)
-        target.wait_for_timeout(250)
-        href = _grab()
-        if href:
-            return href
-    except:
-        pass
-
-    # Intento 2: mini scroll rápido y reintento
+            break
+    # Empujón final para asegurar lazy-load
     _quick_scroll(target)
-    href = _grab()
-    if href:
-        return href
+    _auto_scroll_until_bottom(target, step_px=1800, max_tries=5, pause_ms=120)
 
-    # Intento 3: otro 'Ver más' si existe
+def _collect_all_invoice_hrefs(target) -> List[str]:
+    """Devuelve lista única (ordenada) de todos los href de facturas en el listado."""
     try:
-        btn = target.get_by_text("Ver más", exact=False).first
-        btn.click(timeout=800)
-        target.wait_for_timeout(250)
-        href = _grab()
-        if href:
-            return href
+        hrefs = target.evaluate("""
+            () => Array.from(
+                document.querySelectorAll("a[href*='invoice.stripe.com/i/']")
+            ).map(a => a.href)
+        """) or []
     except:
-        pass
-
-    return None
+        hrefs = []
+    # Quitar duplicados preservando orden
+    return list(dict.fromkeys(hrefs))
 
 def _extract_invoice_date(page) -> str:
     """
@@ -151,7 +129,6 @@ def _extract_invoice_date(page) -> str:
       - 25 oct 2025
       - October 25, 2025
       - 25/10/2025 y 2025-10-25
-    Si no encuentra fecha válida, devuelve la fecha de hoy.
     """
     def _norm(s: str) -> str:
         return (s or "").strip().lower()\
@@ -172,7 +149,7 @@ def _extract_invoice_date(page) -> str:
         page.wait_for_load_state("domcontentloaded", timeout=8000)
     except:
         pass
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(200)
 
     try:
         body = page.inner_text("body")
@@ -180,57 +157,51 @@ def _extract_invoice_date(page) -> str:
         body = ""
     text = _norm(body)
 
-    def _fmt(y:int,m:int,d:int) -> str | None:
+    def _fmt(y:int,m:int,d:int):
         if 2020 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31:
             return f"{y}_{str(m).zfill(2)}_{str(d).zfill(2)}"
         return None
 
-    # 1) Español largo
     m = re.search(r"(\d{1,2})\s+de\s+([a-zñ]+)\s+de\s+(\d{4})", text)
     if m:
         d, mon, y = m.groups()
-        mon = month_map.get(mon, None)
+        mon = month_map.get(mon)
         if mon:
             out = _fmt(int(y), mon, int(d))
             if out: return out
 
-    # 2) Español corto
     m = re.search(r"(\d{1,2})\s+([a-zñ]+)\s+(\d{4})", text)
     if m:
         d, mon, y = m.groups()
-        mon = month_map.get(mon, None)
+        mon = month_map.get(mon)
         if mon:
             out = _fmt(int(y), mon, int(d))
             if out: return out
 
-    # 3) Inglés
     m = re.search(r"([a-z]+)\s+(\d{1,2}),\s*(\d{4})", text)
     if m:
         mon, d, y = m.groups()
-        mon = month_map.get(mon, None)
+        mon = month_map.get(mon)
         if mon:
             out = _fmt(int(y), mon, int(d))
             if out: return out
 
-    # 4) Numéricos YYYY-MM-DD
     m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
     if m:
         y, mth, d = map(int, m.groups())
         out = _fmt(y, mth, d)
         if out: return out
 
-    # 5) Numéricos DD/MM/YYYY
     m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text)
     if m:
         d, mth, y = map(int, m.groups())
         out = _fmt(y, mth, d)
         if out: return out
 
-    # Fallback: hoy
     return datetime.now().strftime("%Y_%m_%d")
 
 # ------------------------- Flujo principal -------------------------
-def descargar_factura() -> Dict[str, str]:
+def descargar_facturas() -> Dict[str, str]:
     browser = None
     context = None
     try:
@@ -303,19 +274,16 @@ def descargar_factura() -> Dict[str, str]:
             el.click()
             abierto = True
         except:
-            try:
-                ok = page.evaluate("""
-                    () => {
-                        const txt = 'Billing & Invoices';
-                        for (const el of document.querySelectorAll('a,button,[role="link"],[role="button"]')) {
-                            if (el.innerText && el.innerText.includes(txt)) { el.click(); return true; }
-                        }
-                        return false;
+            ok = page.evaluate("""
+                () => {
+                    const txt = 'Billing & Invoices';
+                    for (const el of document.querySelectorAll('a,button,[role="link"],[role="button"]')) {
+                        if (el.innerText && el.innerText.includes(txt)) { el.click(); return true; }
                     }
-                """)
-                if ok: abierto = True
-            except:
-                pass
+                    return false;
+                }
+            """)
+            if ok: abierto = True
         if not abierto:
             raise Exception("No se encontró 'Billing & Invoices'.")
 
@@ -342,14 +310,13 @@ def descargar_factura() -> Dict[str, str]:
         if not manage_btn:
             raise Exception("No se encontró 'Manage subscription'.")
 
-        # Preferimos MISMA pestaña
         try:
             manage_btn.click()
         except:
             page.evaluate("el => el.click()", manage_btn)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(900)
 
-        new_page = context.pages[-1]  # misma o nueva: la última
+        new_page = context.pages[-1]
         try: new_page.bring_to_front()
         except: pass
         try: new_page.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -362,118 +329,128 @@ def descargar_factura() -> Dict[str, str]:
         target = billing_frame if billing_frame else new_page
         _focus_invoice_tab_if_needed(target)
 
-        # ======= BLOQUE RÁPIDO PARA ENCONTRAR LA FACTURA =======
-        print("⚡ Buscando enlace de factura sin scroll pesado…")
-        href = _find_first_invoice_href_fast(target)
-        if not href:
-            # último recurso rápido: mini scroll + detección
-            _quick_scroll(target)
-            _wait_for_invoice_list(target, timeout_ms=3000)
-            href = _find_first_invoice_href_fast(target)
+        # Mostrar listado y expandir todo
+        print("📜 Mostrando listado de facturas y expandiendo 'Ver más'…")
+        _wait_for_invoice_list(target, timeout_ms=8000)
+        _expand_all_invoices(target)
 
-        if not href:
-            # como fallback extremo, un scroll algo más profundo pero corto
-            _auto_scroll_until_bottom(target, step_px=1800, max_tries=10, pause_ms=120)
-            href = _find_first_invoice_href_fast(target)
-
-        if not href:
+        # Recoger TODOS los enlaces
+        hrefs = _collect_all_invoice_hrefs(target)
+        if not hrefs:
             raise Exception("No se encontraron enlaces directos de facturas (invoice.stripe.com).")
+        print(f"🧾 Facturas detectadas: {len(hrefs)}")
 
-        # Abrir factura en la MISMA pestaña
-        print("🖱️ Abriendo la factura en la misma pestaña con goto()…")
-        new_page.goto(href, wait_until="domcontentloaded", timeout=30000)
-        try: new_page.wait_for_load_state("networkidle", timeout=15000)
-        except: pass
+        # Guardar URL del listado (para volver después de cada descarga)
+        try:
+            list_url = getattr(target, "url", None) or new_page.url
+        except:
+            list_url = new_page.url
 
-        invoice_page = new_page
-        invoice_page.wait_for_timeout(800)
+        # Parámetros de descarga rápida
+        DOWNLOAD_WAIT_VISIBLE = 1500   # 1.5s
+        DOWNLOAD_EXPECT_MS   = 8000    # 8s
 
-        # ---- Fecha para la carpeta
-        print("🗓️ Extrayendo fecha de la factura…")
-        fecha_texto = _extract_invoice_date(invoice_page)
+        descargadas = 0
+        errores = []
 
-        # ---- Carpeta destino
-        desktop_path = Path.home() / "Desktop"
-        facturas_dir = desktop_path / "FACTURAS"
-        facturas_dir.mkdir(exist_ok=True)
-        directorio_destino = facturas_dir / f"cursor_{fecha_texto}"
-        directorio_destino.mkdir(exist_ok=True)
-        ruta_archivo = directorio_destino / "invoice.pdf"
-        print(f"📁 Directorio de factura: {directorio_destino}")
+        for idx, href in enumerate(hrefs, 1):
+            print(f"\n➡️  ({idx}/{len(hrefs)}) Abriendo factura: {href}")
+            # Abrir factura en MISMA pestaña
+            new_page.goto(href, wait_until="domcontentloaded", timeout=30000)
+            try: new_page.wait_for_load_state("networkidle", timeout=15000)
+            except: pass
+            invoice_page = new_page
+            invoice_page.wait_for_timeout(400)
 
-        # ---- Click en “Descargar factura” (ACELERADO)
-        print("⬇️ Pulsando 'Descargar factura' (rápido)…")
-        DOWNLOAD_WAIT_VISIBLE = 1500   # 1.5s para que aparezca
-        DOWNLOAD_EXPECT_MS   = 8000    # 8s para que arranque la descarga
+            # Fecha -> carpeta
+            fecha_texto = _extract_invoice_date(invoice_page)
+            desktop_path = Path.home() / "Desktop"
+            facturas_dir = desktop_path / "FACTURAS"
+            facturas_dir.mkdir(exist_ok=True)
+            directorio_destino = facturas_dir / f"cursor_{fecha_texto}"
+            directorio_destino.mkdir(exist_ok=True)
+            ruta_archivo = directorio_destino / "invoice.pdf"
+            print(f"📁 Directorio de factura: {directorio_destino}")
 
-        download = None
+            # Click rápido en “Descargar factura”
+            print("⬇️ Pulsando 'Descargar factura' (rápido)…")
+            download = None
 
-        def _try_click_fast(loc):
-            """Click inmediato/forzado y esperar descarga con timeout corto."""
-            nonlocal download
+            def _try_click_fast(loc):
+                nonlocal download
+                try:
+                    loc.wait_for(state="visible", timeout=DOWNLOAD_WAIT_VISIBLE)
+                except:
+                    pass
+                try:
+                    with invoice_page.expect_download(timeout=DOWNLOAD_EXPECT_MS) as dlinfo:
+                        loc.click(timeout=DOWNLOAD_WAIT_VISIBLE, force=True)
+                    download = dlinfo.value
+                    return True
+                except Exception:
+                    return False
+
+            ok_clicked = False
             try:
-                loc.wait_for(state="visible", timeout=DOWNLOAD_WAIT_VISIBLE)
+                btn = invoice_page.locator("[data-testid='download-invoice-pdf-button']").first
+                ok_clicked = _try_click_fast(btn)
             except:
                 pass
-            try:
-                with invoice_page.expect_download(timeout=DOWNLOAD_EXPECT_MS) as dlinfo:
-                    loc.click(timeout=DOWNLOAD_WAIT_VISIBLE, force=True)
-                download = dlinfo.value
-                return True
-            except Exception:
-                return False
 
-        # 1) data-testid oficial de Stripe
-        try:
-            btn = invoice_page.locator("[data-testid='download-invoice-pdf-button']").first
-            if not _try_click_fast(btn):
-                pass
-        except Exception:
-            pass
+            if not ok_clicked:
+                for txt in ["Descargar factura", "Download invoice", "Download", "Descargar", "Descargar PDF"]:
+                    try:
+                        btn = invoice_page.get_by_text(txt, exact=False).first
+                        if _try_click_fast(btn):
+                            ok_clicked = True
+                            break
+                    except:
+                        continue
 
-        # 2) Texto visible (fallback rápido)
-        if not download:
-            for txt in ["Descargar factura", "Download invoice", "Download", "Descargar", "Descargar PDF"]:
+            if not ok_clicked:
+                for sel in [
+                    'button:has-text("Descargar factura")',
+                    'a:has-text("Descargar factura")',
+                    'button:has-text("Download")',
+                    'a:has-text("Download")',
+                    "[data-testid='download-invoice-receipt-pdf-button']"
+                ]:
+                    try:
+                        btn = invoice_page.locator(sel).first
+                        if _try_click_fast(btn):
+                            ok_clicked = True
+                            break
+                    except:
+                        continue
+
+            if not download:
+                msg = "No se pudo iniciar la descarga del PDF (timeout rápido)."
+                print("❌ " + msg)
+                errores.append({"href": href, "error": msg})
+            else:
                 try:
-                    btn = invoice_page.get_by_text(txt, exact=False).first
-                    if _try_click_fast(btn):
-                        break
-                except Exception:
-                    continue
+                    download.save_as(str(ruta_archivo))
+                except Exception as e:
+                    temp_path = None
+                    try:
+                        temp_path = download.path()
+                    except:
+                        pass
+                    if not temp_path or not Path(temp_path).exists():
+                        errores.append({"href": href, "error": str(e)})
+                    else:
+                        Path(temp_path).replace(ruta_archivo)
+                print("✅ Factura guardada correctamente.")
+                descargadas += 1
 
-        # 3) Selectores genéricos (último recurso)
-        if not download:
-            for sel in [
-                'button:has-text("Descargar factura")',
-                'a:has-text("Descargar factura")',
-                'button:has-text("Download")',
-                'a:has-text("Download")',
-                "[data-testid='download-invoice-receipt-pdf-button']"  # recibo si el otro falla
-            ]:
-                try:
-                    btn = invoice_page.locator(sel).first
-                    if _try_click_fast(btn):
-                        break
-                except Exception:
-                    continue
-
-        if not download:
-            raise Exception("No se pudo iniciar la descarga del PDF de la factura (timeout rápido).")
-
-        # Guardar archivo
-        print(f"💾 Guardando en: {ruta_archivo}")
-        try:
-            download.save_as(str(ruta_archivo))
-        except Exception as e:
-            temp_path = None
-            try:
-                temp_path = download.path()
-            except:
-                pass
-            if not temp_path or not Path(temp_path).exists():
-                raise e
-            Path(temp_path).replace(ruta_archivo)
-        print("✅ Factura guardada correctamente.")
+            # Volver al listado para la siguiente
+            print("↩️ Volviendo al listado…")
+            new_page.goto(list_url, wait_until="domcontentloaded", timeout=30000)
+            try: new_page.wait_for_load_state("networkidle", timeout=15000)
+            except: pass
+            # Si hay iframe, volver a enganchar target
+            billing_frame = _find_billing_frame(new_page)
+            target = billing_frame if billing_frame else new_page
 
         # Persistir cookies
         try:
@@ -486,16 +463,17 @@ def descargar_factura() -> Dict[str, str]:
             browser.close()
         playwright.stop()
 
-        return {
+        resumen = {
             "estado": "exitoso",
-            "mensaje": "Factura descargada exitosamente",
-            "ruta": str(ruta_archivo.absolute()),
-            "directorio": str(directorio_destino.absolute()),
-            "carpeta": "Escritorio/FACTURAS"
+            "mensaje": f"Descargadas {descargadas} factura(s).",
+            "descargadas": descargadas,
+            "errores": errores,
+            "carpeta_base": str((Path.home() / 'Desktop' / 'FACTURAS').absolute()),
         }
+        return JSONResponse(status_code=200, content=resumen)
 
     except Exception as e:
-        err = f"Error al descargar la factura: {str(e)}"
+        err = f"Error al descargar facturas: {str(e)}"
         print(f"\n❌ {err}")
         print("⚠ El navegador permanece abierto para inspección.")
         raise Exception(err)
@@ -503,16 +481,16 @@ def descargar_factura() -> Dict[str, str]:
 # ------------------------- FastAPI -------------------------
 @app.get("/")
 async def root():
-    return {"mensaje": "API de Facturas de Cursor", "endpoints": {"descargar_factura": "/api/factura/descargar"}}
+    return {"mensaje": "API de Facturas de Cursor", "endpoints": {"descargar_facturas": "/api/facturas/descargar"}}
 
-@app.post("/api/factura/descargar")
-async def descargar_factura_endpoint():
+@app.post("/api/facturas/descargar")
+async def descargar_facturas_endpoint():
     try:
         loop = asyncio.get_event_loop()
-        resultado = await loop.run_in_executor(None, descargar_factura)
-        return JSONResponse(status_code=200, content=resultado)
+        resultado = await loop.run_in_executor(None, descargar_facturas)
+        return resultado
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al descargar la factura: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al descargar facturas: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
