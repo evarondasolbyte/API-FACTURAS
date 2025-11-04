@@ -31,6 +31,7 @@ def _auto_scroll_until_bottom(page_or_frame, *, step_px: int = 1200, max_tries: 
             break
 
 def _quick_scroll(page_or_frame):
+    # Mini empujón para forzar lazy-load
     try:
         page_or_frame.evaluate("""
             () => {
@@ -92,7 +93,7 @@ def _wait_for_invoice_list(target, timeout_ms: int = 12000):
     return False
 
 def _expand_all_invoices(target, max_clicks: int = 30):
-    """Pulsa 'Ver más' repetidamente hasta que ya no aparezca."""
+    """Pulsa 'Ver más' repetidamente hasta que ya no aparezca (rápido)."""
     clicks = 0
     while clicks < max_clicks:
         try:
@@ -118,8 +119,7 @@ def _collect_all_invoice_hrefs(target) -> List[str]:
         """) or []
     except:
         hrefs = []
-    # Quitar duplicados preservando orden
-    return list(dict.fromkeys(hrefs))
+    return list(dict.fromkeys(hrefs))  # quita duplicados preservando orden
 
 def _extract_invoice_date(page) -> str:
     """
@@ -289,7 +289,7 @@ def descargar_facturas() -> Dict[str, str]:
 
         page.wait_for_load_state("networkidle", timeout=15000)
 
-        # ---- Manage subscription
+        # ---- Manage subscription (captura de popup/pestaña correcta)
         print("🧭 Abriendo 'Manage subscription'…")
         manage_btn = None
         for txt in ["Manage subscription", "Gestionar suscripción", "Manage", "Gestionar"]:
@@ -310,13 +310,29 @@ def descargar_facturas() -> Dict[str, str]:
         if not manage_btn:
             raise Exception("No se encontró 'Manage subscription'.")
 
+        new_page = None
         try:
-            manage_btn.click()
-        except:
-            page.evaluate("el => el.click()", manage_btn)
-        page.wait_for_timeout(900)
+            with page.expect_popup() as pinfo:
+                try:
+                    manage_btn.click()
+                except:
+                    page.evaluate("el => el.click()", manage_btn)
+            new_page = pinfo.value
+        except Exception:
+            # Fallback si no hubo popup (misma pestaña o pestaña previa)
+            try:
+                manage_btn.click()
+            except:
+                page.evaluate("el => el.click()", manage_btn)
+            page.wait_for_timeout(800)
+            for p in context.pages[::-1]:
+                u = (p.url or "").lower()
+                if any(s in u for s in ("billing.stripe", "invoice.stripe", "/p/session", "portal")):
+                    new_page = p
+                    break
+        if not new_page:
+            new_page = page  # última salvaguarda
 
-        new_page = context.pages[-1]
         try: new_page.bring_to_front()
         except: pass
         try: new_page.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -448,7 +464,6 @@ def descargar_facturas() -> Dict[str, str]:
             new_page.goto(list_url, wait_until="domcontentloaded", timeout=30000)
             try: new_page.wait_for_load_state("networkidle", timeout=15000)
             except: pass
-            # Si hay iframe, volver a enganchar target
             billing_frame = _find_billing_frame(new_page)
             target = billing_frame if billing_frame else new_page
 
