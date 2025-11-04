@@ -82,35 +82,109 @@ def _wait_for_invoice_list(target, timeout_ms: int = 12000):
 
 def _extract_invoice_date(page) -> str:
     """
-    Devuelve 'YYYY_MM_DD' a partir del contenido de la factura.
+    Devuelve 'YYYY_MM_DD' a partir del contenido visible en la factura.
+    Soporta:
+      - 25 de octubre de 2025
+      - 25 oct 2025
+      - October 25, 2025
+      - 25/10/2025 y 2025-10-25
     Si no encuentra fecha válida, devuelve la fecha de hoy.
     """
+    import re
+    from datetime import datetime
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()\
+            .replace("á","a").replace("é","e").replace("í","i")\
+            .replace("ó","o").replace("ú","u").replace("ç","c")
+
+    # mapas de meses (es/en), corto y largo
+    month_map = {
+        "ene":1, "enero":1,
+        "feb":2, "febrero":2,
+        "mar":3, "marzo":3,
+        "abr":4, "abril":4,
+        "may":5, "mayo":5,
+        "jun":6, "junio":6,
+        "jul":7, "julio":7,
+        "ago":8, "agosto":8,
+        "sep":9, "sept":9, "septi":9, "septiembre":9, "set":9, "setiembre":9,
+        "oct":10, "octubre":10,
+        "nov":11, "noviembre":11,
+        "dic":12, "diciembre":12,
+        "jan":1, "january":1,
+        "february":2, "feb":2,
+        "mar":3, "march":3,
+        "apr":4, "april":4,
+        "may":5,
+        "jun":6, "june":6,
+        "jul":7, "july":7,
+        "aug":8, "august":8,
+        "sep":9, "september":9,
+        "oct":10, "october":10,
+        "nov":11, "november":11,
+        "dec":12, "december":12,
+    }
+
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=5000)
-        page.wait_for_timeout(300)
-        body = ""
-        try:
-            body = page.inner_text("body")
-        except:
-            pass
-        patrones = [
-            r'(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})',     # YYYY-MM-DD
-            r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})',     # DD/MM/YYYY
-        ]
-        for patron in patrones:
-            for match in re.findall(patron, body):
-                if len(match[0]) == 4:
-                    año, mes, dia = match
-                else:
-                    dia, mes, año = match
-                try:
-                    y = int(año); m = int(mes); d = int(dia)
-                    if 2020 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31:
-                        return f"{y}_{str(m).zfill(2)}_{str(d).zfill(2)}"
-                except:
-                    continue
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
     except:
         pass
+    page.wait_for_timeout(300)
+
+    try:
+        body = page.inner_text("body")
+    except:
+        body = ""
+    text = _norm(body)
+
+    def _fmt(y:int,m:int,d:int) -> str:
+        if 2020 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y}_{str(m).zfill(2)}_{str(d).zfill(2)}"
+        return None
+
+    # 1) Español largo: "25 de octubre de 2025"
+    m = re.search(r"(\d{1,2})\s+de\s+([a-zñ]+)\s+de\s+(\d{4})", text)
+    if m:
+        d, mon, y = m.groups()
+        mon = month_map.get(mon, None)
+        if mon:
+            out = _fmt(int(y), mon, int(d))
+            if out: return out
+
+    # 2) Español corto: "25 oct 2025"
+    m = re.search(r"(\d{1,2})\s+([a-zñ]+)\s+(\d{4})", text)
+    if m:
+        d, mon, y = m.groups()
+        mon = month_map.get(mon, None)
+        if mon:
+            out = _fmt(int(y), mon, int(d))
+            if out: return out
+
+    # 3) Inglés: "October 25, 2025"
+    m = re.search(r"([a-z]+)\s+(\d{1,2}),\s*(\d{4})", text)
+    if m:
+        mon, d, y = m.groups()
+        mon = month_map.get(mon, None)
+        if mon:
+            out = _fmt(int(y), mon, int(d))
+            if out: return out
+
+    # 4) Numéricos: YYYY-MM-DD
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if m:
+        y, mth, d = map(int, m.groups())
+        out = _fmt(y, mth, d)
+        if out: return out
+
+    # 5) Numéricos: DD/MM/YYYY
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text)
+    if m:
+        d, mth, y = map(int, m.groups())
+        out = _fmt(y, mth, d)
+        if out: return out
+
+    # Fallback: hoy
     return datetime.now().strftime("%Y_%m_%d")
 
 # ------------------------- Flujo principal -------------------------
