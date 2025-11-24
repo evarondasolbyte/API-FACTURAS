@@ -1,0 +1,6 @@
+# Ignorar entorno virtual
+.venv/
+__pycache__/
+
+# Ignorar claves privadas
+service_account.json
